@@ -63,6 +63,57 @@ def create_dflash_block_mask(
     )
 
 
+def create_dflash_dense_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    S: int,
+    block_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Construct a dense 4D attention mask for DFlash training (for SDPA/eager backends).
+
+    Same semantics as create_dflash_block_mask but returns a standard
+    [B, 1, Q_LEN, KV_LEN] float tensor where 0.0 = attend, -inf = masked.
+    """
+    B, N = anchor_positions.shape
+    Q_LEN = N * block_size
+    KV_LEN = S + Q_LEN
+
+    q_idx = torch.arange(Q_LEN, device=device)
+    kv_idx = torch.arange(KV_LEN, device=device)
+
+    q_block_id = q_idx // block_size  # [Q_LEN]
+
+    # anchor position for each query token: [B, Q_LEN]
+    anchor_pos_for_q = anchor_positions[:, q_block_id]
+
+    # Context mask: kv is in context range AND kv_idx < anchor_pos
+    is_context = kv_idx < S  # [KV_LEN]
+    mask_context = is_context.view(1, 1, -1) & (
+        kv_idx.view(1, 1, -1) < anchor_pos_for_q.unsqueeze(-1)
+    )  # [B, Q_LEN, KV_LEN]
+
+    # Draft mask: kv is in draft range AND same block
+    is_draft = kv_idx >= S  # [KV_LEN]
+    kv_block_id = (kv_idx - S) // block_size  # [KV_LEN]
+    mask_draft = is_draft.view(1, 1, -1) & (
+        q_block_id.view(1, -1, 1) == kv_block_id.view(1, 1, -1)
+    )  # [1, Q_LEN, KV_LEN]
+
+    # Valid block mask: [B, Q_LEN]
+    is_valid = block_keep_mask[:, q_block_id]
+
+    # Combine: [B, Q_LEN, KV_LEN]
+    mask = (mask_context | mask_draft) & is_valid.unsqueeze(-1)
+
+    # Convert to additive float mask for SDPA: 0 = attend, -inf = masked
+    attn_mask = torch.zeros(B, 1, Q_LEN, KV_LEN, device=device, dtype=dtype)
+    attn_mask.masked_fill_(~mask.unsqueeze(1), float("-inf"))
+
+    return attn_mask
+
+
 class OnlineDFlashModel(nn.Module):
     """DFlash online training wrapper with block-wise CE loss."""
 
@@ -205,13 +256,23 @@ class OnlineDFlashModel(nn.Module):
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
-        dflash_attn_mask = create_dflash_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            S=seq_len,
-            block_size=self.block_size,
-            device=device,
-        )
+        if self.attention_backend == "flex_attention":
+            dflash_attn_mask = create_dflash_block_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                S=seq_len,
+                block_size=self.block_size,
+                device=device,
+            )
+        else:
+            dflash_attn_mask = create_dflash_dense_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                S=seq_len,
+                block_size=self.block_size,
+                device=device,
+                dtype=hidden_states.dtype,
+            )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
