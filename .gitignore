@@ -199,3 +199,8 @@ wandb/
 
 # macOS
 .DS_Store
+data/
+qwen3_nonthinking.jinja
+CLAUDE.md
+*.jsonl
+*.ipynb
