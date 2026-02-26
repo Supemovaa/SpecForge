@@ -118,6 +118,14 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        kernel_options = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 64,
+            "BLOCK_M2": 64,
+            "BLOCK_N2": 64,
+        }
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -127,6 +135,7 @@ class Qwen3DFlashAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
+            kernel_options=kernel_options,
             **kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)
